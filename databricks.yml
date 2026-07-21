@@ -1,0 +1,59 @@
+# Databricks Asset Bundle definition for the pharmacovigilance pipeline.
+# This file is the "infrastructure as code" version of the Job you built by hand
+# in the UI (Bronze_Ingestion -> silver_transformation -> gold_star_schema).
+#
+# Running `databricks bundle deploy` reads this file and creates/updates the Job
+# in your workspace to match it exactly — no manual clicking required.
+
+bundle:
+  name: pharmacovigilance_pipeline
+
+# ---------------------------------------------------------------------------
+# Resources: the Job itself, defined as code
+# ---------------------------------------------------------------------------
+resources:
+  jobs:
+    pharmacovigilance_pipeline:
+      name: pharmacovigilance_pipeline
+
+      # No cluster/compute block specified on purpose — this lets each task
+      # default to Serverless, matching the only compute type available on
+      # Databricks Free Edition. If you ever move to a workspace with classic
+      # clusters, you'd add a `job_clusters:` block here instead.
+
+      tasks:
+        - task_key: bronze_ingestion
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/01_Bronze_Level_Ingestion
+
+        - task_key: silver_transformation
+          depends_on:
+            - task_key: bronze_ingestion
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/02_Silver_Level_Flattening
+
+        - task_key: gold_star_schema
+          depends_on:
+            - task_key: silver_transformation
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/03_Gold_Layer_Star_Schema
+
+      # Uncomment to run automatically on a schedule instead of only manual triggers.
+      # Since all three notebooks have skip-if-exists guards, a daily schedule is
+      # cheap even on days with no new data — each stage just exits immediately.
+      #
+      # schedule:
+      #   quartz_cron_expression: "0 0 6 * * ?"   # every day at 6 AM
+      #   timezone_id: "Asia/Kolkata"
+      #   pause_status: UNPAUSED
+
+# ---------------------------------------------------------------------------
+# Targets: which workspace this deploys to. "dev" is the only one for now —
+# you'd add a separate "prod" target later if you ever split environments.
+# ---------------------------------------------------------------------------
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://<your-workspace-url>.azuredatabricks.net   # <-- replace with your real workspace URL
+    default: true
