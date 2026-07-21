@@ -1,0 +1,28 @@
+# .github/workflows/deploy-databricks-job.yml
+#
+# Runs automatically on every push to main. Deploys the Databricks Asset Bundle
+# (databricks.yml), which creates/updates the Job in Databricks to match whatever
+# is currently in this repo — no manual UI clicking needed after the first setup.
+
+name: Deploy Databricks Job
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # also allows manually triggering this workflow from the GitHub UI
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Deploy bundle to Databricks
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: databricks bundle deploy -t dev
