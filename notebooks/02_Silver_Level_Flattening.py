@@ -76,6 +76,24 @@ print("Connected to storage account:", storage_account_name)
 
 # COMMAND ----------
 
+force_refresh = True
+
+silver_tables_exist = all(
+    spark.catalog.tableExists(t) for t in ["silver.events", "silver.event_drug", "silver.event_reaction"]
+)
+
+if silver_tables_exist and not force_refresh:
+    print("Silver tables already exist and force_refresh is False — skipping the rebuild.")
+    dbutils.notebook.exit("Skipped: Silver tables already exist")
+else:
+    if not silver_tables_exist:
+        print("Silver tables not found — proceeding with full build.")
+    else:
+        print("force_refresh is True — proceeding with full rebuild despite existing tables.")
+
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Step 1 — Build the list of weekly date ranges to pull
 # MAGIC
