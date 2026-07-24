@@ -30,6 +30,30 @@ from pyspark.sql.window import Window
 
 spark.sql("CREATE SCHEMA IF NOT EXISTS pharmacovigilance_ws.gold")
 
+# COMMAND ----------
+
+force_refresh = True
+
+gold_tables = [
+    "dim_date", "dim_patient", "dim_drug", "dim_manufacturer", "dim_reaction",
+    "fact_adverse_event", "bridge_event_drug", "bridge_event_reaction",
+]
+
+gold_tables_exist = all(
+    spark.catalog.tableExists(f"pharmacovigilance_ws.gold.{t}") for t in gold_tables
+)
+
+if gold_tables_exist and not force_refresh:
+    print("Gold tables already exist and force_refresh is False — skipping the rebuild.")
+    dbutils.notebook.exit("Skipped: Gold tables already exist")
+else:
+    if not gold_tables_exist:
+        print("Gold tables not found — proceeding with full build.")
+    else:
+        print("force_refresh is True — proceeding with full rebuild despite existing tables.")
+
+# ----------------------------------------------------------------------------------------------------------------
+
 df_events = spark.table("silver.events")
 df_event_drug = spark.table("silver.event_drug")
 df_event_reaction = spark.table("silver.event_reaction")
