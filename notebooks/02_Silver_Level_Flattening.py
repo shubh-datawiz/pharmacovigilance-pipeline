@@ -53,7 +53,7 @@ openfda_api_key = None
 # If True, weeks that already have files in Bronze are skipped entirely — no OpenFDA
 # calls made for them at all. Set to False to force a full re-pull of every week
 # regardless of what's already there (e.g. if you suspect a prior run was incomplete).
-skip_existing = True
+skip_existing = False
 
 # A default requests User-Agent (python-requests/x.x) can get blocked by OpenFDA's
 # edge bot-protection with a 403, even though nothing is actually wrong with the
