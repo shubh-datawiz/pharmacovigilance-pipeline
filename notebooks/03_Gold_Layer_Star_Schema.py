@@ -32,7 +32,7 @@ spark.sql("CREATE SCHEMA IF NOT EXISTS pharmacovigilance_ws.gold")
 
 # COMMAND ----------
 
-force_refresh = True
+force_refresh = False
 
 gold_tables = [
     "dim_date", "dim_patient", "dim_drug", "dim_manufacturer", "dim_reaction",
