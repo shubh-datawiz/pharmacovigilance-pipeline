@@ -48,7 +48,7 @@ max_retries = 3
 # Optional but recommended: get a free key at https://open.fda.gov/apis/authentication/
 # Raises your rate limit and makes 403 bot-protection blocks far less likely.
 # Leave as None to run without one.
-openfda_api_key = None
+openfda_api_key = 'I8VdJVZAFb21pF0AIydykA4Ai87fLRHQF8MCGRXc'
 
 # If True, weeks that already have files in Bronze are skipped entirely — no OpenFDA
 # calls made for them at all. Set to False to force a full re-pull of every week
