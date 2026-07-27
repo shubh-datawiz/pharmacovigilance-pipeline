@@ -1,82 +1,76 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Bronze Layer — OpenFDA Adverse Events (Full Ingestion)
+# MAGIC # Silver Layer — OpenFDA Adverse Events
 # MAGIC ### Pharmacovigilance & Regulatory Compliance Pipeline
 # MAGIC
-# MAGIC Upgrades the earlier single-file test script into a real ingestion job:
-# MAGIC - Loops across a date range in **weekly chunks** (keeps each query's result count
-# MAGIC   safely under OpenFDA's 25,000 skip+limit ceiling)
-# MAGIC - **Paginates** within each week using `limit` + `skip` until all matching records
-# MAGIC   for that week are pulled
-# MAGIC - **Rate-limits** itself with small pauses and retries failed requests
-# MAGIC - Writes each page as its own JSON blob into `bronze/adverse_events/YYYY/MM/...`
-# MAGIC   using the `azure-storage-blob` SDK directly — this bypasses Spark entirely,
-# MAGIC   so it works the same whether you're on Serverless or a cluster.
-
-# COMMAND ----------
-
-import requests
-import json
-import time
-from azure.storage.blob import BlobServiceClient
-from datetime import date, timedelta
+# MAGIC **Goal:** Read raw Bronze JSON, flatten nested `patient.drug[]` and `patient.reaction[]`
+# MAGIC arrays using `explode()`, cleanse/standardize types, deduplicate, and write three
+# MAGIC clean Delta tables to the `silver` container:
+# MAGIC
+# MAGIC 1. `silver_events`        — one row per adverse event report (safetyreportid)
+# MAGIC 2. `silver_event_drug`    — one row per (event, drug) pair
+# MAGIC 3. `silver_event_reaction`— one row per (event, reaction) pair
+# MAGIC
+# MAGIC These three tables are the direct feed for your Gold-layer Star Schema:
+# MAGIC `Fact_Adverse_Event`, `Dim_Patient`, `Dim_Drug`, `Dim_Reaction`,
+# MAGIC `Bridge_Event_Drug`, `Bridge_Event_Reaction`.
+# MAGIC
+# MAGIC **Cost note:** Every write below uses `.coalesce()` before saving. On a free-tier
+# MAGIC single-node cluster, this avoids the "small file problem" (hundreds of tiny output
+# MAGIC files that are slow and costly to list/read later) — keep this pattern for every
+# MAGIC Silver/Gold write you build going forward.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 0 — Config
-# MAGIC
-# MAGIC Adjust `start_date` / `end_date` to control how much history you pull. Wider
-# MAGIC ranges mean more requests and longer runtime — start with a few months while
-# MAGIC you're validating, then widen once you're confident it's stable.
+# MAGIC ## Step 0 — Config & Authentication
+# MAGIC We reuse the same Databricks Secret Scope (`pharmacovigilance`) you already set up
+# MAGIC for Bronze ingestion, so no credentials are hardcoded here.
 
 # COMMAND ----------
 
-storage_account_name = "pharmacovigilance01"
-container_name = "bronze"
+from pyspark.sql import functions as F
+
+# --- Storage account / container config ---
+storage_account = "pharmacovigilance01"
 secret_scope = "pharmacovigilance"
-secret_key_name = "adls_pharmacovigilance01_key"
+secret_key_name = "storage-access-key"   # <-- update this to match the exact key name you used when saving the secret
 
-start_date = date(2024, 1, 1)
-end_date = date(2024, 3, 31)   # ~13 weeks of data — a reasonable first real pull
+bronze_container = "bronze"
+silver_container = "silver"
 
-page_limit = 1000              # OpenFDA's max records per request
-max_skip_per_query = 25000     # OpenFDA's hard ceiling on skip + limit combined
-request_pause_seconds = 0.3    # small pause between requests, stays well under rate limits
-max_retries = 3
-
-# Optional but recommended: get a free key at https://open.fda.gov/apis/authentication/
-# Raises your rate limit and makes 403 bot-protection blocks far less likely.
-# Leave as None to run without one.
-openfda_api_key = None
-
-# If True, weeks that already have files in Bronze are skipped entirely — no OpenFDA
-# calls made for them at all. Set to False to force a full re-pull of every week
-# regardless of what's already there (e.g. if you suspect a prior run was incomplete).
-skip_existing = True
-
-# A default requests User-Agent (python-requests/x.x) can get blocked by OpenFDA's
-# edge bot-protection with a 403, even though nothing is actually wrong with the
-# request itself. Sending a normal browser-style header avoids this.
-request_headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-}
-
-# COMMAND ----------
-
-access_key = dbutils.secrets.get(scope=secret_scope, key=secret_key_name)
-blob_service_client = BlobServiceClient(
-    account_url=f"https://{storage_account_name}.blob.core.windows.net",
-    credential=access_key
+# Tell Spark how to authenticate against this specific storage account using the access key
+spark.conf.set(
+    f"fs.azure.account.key.{storage_account}.dfs.core.windows.net",
+    dbutils.secrets.get(scope=secret_scope, key=secret_key_name)
 )
-container_client = blob_service_client.get_container_client(container_name)
 
-print("Connected to storage account:", storage_account_name)
+# abfss:// is the ADLS Gen2 driver — required since your storage account is Gen2, not plain Blob
+bronze_path = f"abfss://{bronze_container}@{storage_account}.dfs.core.windows.net/adverse_events/*/*/*.json"
+silver_events_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/events"
+silver_event_drug_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/event_drug"
+silver_event_reaction_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/event_reaction"
+
+print("Bronze read path:", bronze_path)
 
 # COMMAND ----------
 
-force_refresh = True
+# MAGIC %md
+# MAGIC ## Step 0b — Skip if Silver already exists
+# MAGIC
+# MAGIC Unlike Bronze (which skips week by week), Silver always fully rebuilds all three
+# MAGIC tables from every Bronze file in one pass — there's no natural "partial" unit to
+# MAGIC skip. So instead we do one check right here: if all three Silver tables already
+# MAGIC exist, we stop the whole notebook immediately with `dbutils.notebook.exit()`,
+# MAGIC before any of the expensive read/flatten/write cells below even run.
+# MAGIC
+# MAGIC Set `force_refresh = True` whenever you actually want a full rebuild — e.g. after
+# MAGIC widening Bronze's date range with new months, or if you suspect Silver is stale
+# MAGIC or corrupted.
+
+# COMMAND ----------
+
+force_refresh = False
 
 silver_tables_exist = all(
     spark.catalog.tableExists(t) for t in ["silver.events", "silver.event_drug", "silver.event_reaction"]
@@ -84,6 +78,7 @@ silver_tables_exist = all(
 
 if silver_tables_exist and not force_refresh:
     print("Silver tables already exist and force_refresh is False — skipping the rebuild.")
+    print("Set force_refresh = True above and re-run if you need a fresh build (e.g. after new Bronze data).")
     dbutils.notebook.exit("Skipped: Silver tables already exist")
 else:
     if not silver_tables_exist:
@@ -91,215 +86,351 @@ else:
     else:
         print("force_refresh is True — proceeding with full rebuild despite existing tables.")
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1 — Read raw Bronze JSON
+# MAGIC
+# MAGIC Two options worth knowing:
+# MAGIC - `multiline = true` — each of your bronze files is a single JSON *object*
+# MAGIC   (`{"meta": ..., "results": [...]}`) spread across multiple lines. Spark's default
+# MAGIC   JSON reader expects one JSON object per line, so without this option it will
+# MAGIC   fail to parse your files correctly.
+# MAGIC - `columnNameOfCorruptRecord` — if any file is malformed (e.g. a truncated API
+# MAGIC   response from a network hiccup during Bronze ingestion), Spark routes the raw
+# MAGIC   text into this column instead of crashing the whole read. Cheap insurance.
+
+# COMMAND ----------
+
+df_raw = (
+    spark.read
+    .option("multiline", "true")
+    .option("mode", "PERMISSIVE")
+    .option("columnNameOfCorruptRecord", "_corrupt_record")
+    .json(bronze_path)
+)
+
+print("Files parsed. Row count (1 row = 1 raw API response file):", df_raw.count())
+df_raw.printSchema()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 1 — Build the list of weekly date ranges to pull
-# MAGIC
-# MAGIC OpenFDA's `receiptdate` field uses `YYYYMMDD` format inside the search query.
-# MAGIC We generate `[start, end)` pairs one week apart, from `start_date` to `end_date`.
+# MAGIC Check quickly for any corrupted files before proceeding — worth a glance every run.
 
 # COMMAND ----------
 
-def generate_weekly_ranges(start, end):
-    ranges = []
-    current = start
-    while current < end:
-        week_end = min(current + timedelta(days=7), end)
-        ranges.append((current, week_end))
-        current = week_end
-    return ranges
-
-weekly_ranges = generate_weekly_ranges(start_date, end_date)
-print(f"Generated {len(weekly_ranges)} weekly chunks from {start_date} to {end_date}")
-for r in weekly_ranges[:3]:
-    print(" ", r)
-print("  ...")
+if "_corrupt_record" in df_raw.columns:
+    corrupt_count = df_raw.filter(F.col("_corrupt_record").isNotNull()).count()
+    print(f"Corrupt records found: {corrupt_count}")
+else:
+    print("No _corrupt_record column present — nothing was malformed.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 2 — Helper: fetch one page, with retries
+# MAGIC ## Step 2 — Explode `results[]` (one row per adverse event report)
 # MAGIC
-# MAGIC A single function that hits the API once and retries on transient failures
-# MAGIC (network blips, momentary 5xx errors from OpenFDA). It does NOT retry on a
-# MAGIC clean "no results" response — that's a valid outcome, not a failure.
+# MAGIC Each raw file is `{"meta": ..., "results": [event1, event2, ...]}`.
+# MAGIC `explode("results")` turns the single `results` array into one row per event —
+# MAGIC this is the first, outer level of flattening.
 
 # COMMAND ----------
 
-def fetch_page(search_query, skip, limit, retries_left=max_retries):
-    api_url = (
-        "https://api.fda.gov/drug/event.json"
-        f"?search={search_query}&limit={limit}&skip={skip}"
+df_events_exploded = df_raw.select(F.explode("results").alias("event"))
+
+print("Total individual adverse event reports:", df_events_exploded.count())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 3 — Flatten event + patient-level fields
+# MAGIC
+# MAGIC Dot notation (`event.patient.patientsex`) drills into nested structs — no join
+# MAGIC required, since the nesting came from JSON, not from separate tables.
+# MAGIC
+# MAGIC We keep `drug_array` and `reaction_array` as-is here — we'll explode *those*
+# MAGIC separately in Steps 4 and 5, then drop them from the final events table since
+# MAGIC they'll live in their own tables.
+
+# COMMAND ----------
+
+df_events_flat = df_events_exploded.select(
+    F.col("event.safetyreportid").alias("safety_report_id"),
+    F.col("event.safetyreportversion").alias("safety_report_version"),
+    F.to_date(F.col("event.receivedate"), "yyyyMMdd").alias("received_date"),
+    F.to_date(F.col("event.receiptdate"), "yyyyMMdd").alias("receipt_date"),
+    F.col("event.serious").alias("is_serious_flag"),
+    F.col("event.seriousnessdeath").alias("seriousness_death_flag"),
+    F.col("event.seriousnesshospitalization").alias("seriousness_hospitalization_flag"),
+    F.col("event.seriousnesslifethreatening").alias("seriousness_life_threatening_flag"),
+    F.col("event.patient.patientonsetage").cast("double").alias("patient_onset_age"),
+    F.col("event.patient.patientonsetageunit").alias("patient_onset_age_unit_code"),
+    F.col("event.patient.patientsex").alias("patient_sex_code"),
+    F.col("event.patient.patientweight").cast("double").alias("patient_weight_kg"),
+    F.col("event.patient.drug").alias("drug_array"),
+    F.col("event.patient.reaction").alias("reaction_array"),
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 4 — Deduplicate at event grain
+# MAGIC
+# MAGIC Because Bronze was ingested in overlapping weekly batches, the same
+# MAGIC `safetyreportid` can appear more than once. We deduplicate here, once, before
+# MAGIC branching into the drug/reaction tables — so both downstream tables inherit a
+# MAGIC clean, unique set of events.
+
+# COMMAND ----------
+
+before_count = df_events_flat.count()
+
+df_events_dedup = df_events_flat.dropDuplicates(["safety_report_id"])
+
+after_count = df_events_dedup.count()
+print(f"Rows before dedup: {before_count} | after dedup: {after_count} | duplicates removed: {before_count - after_count}")
+
+# Cache this, since we're about to reuse it three times below (once per output table).
+# Caching avoids Spark re-reading and re-parsing all the raw JSON from scratch each time.
+df_events_dedup.cache()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 5 — Build `silver_event_drug` (explode `drug[]`)
+# MAGIC
+# MAGIC This is the second, *inner* level of flattening — one row per (event, drug) pair.
+# MAGIC This table is what `Bridge_Event_Drug` and `Dim_Drug` will be built from in Gold.
+# MAGIC
+# MAGIC `openfda.generic_name` / `brand_name` / `manufacturer_name` are themselves arrays
+# MAGIC inside `drug` (OpenFDA sometimes returns multiple names for one drug entry) — we
+# MAGIC take the first element with `[0]` to keep this table at a clean grain. If you later
+# MAGIC want every alternate name captured, that would need its own explode — flag it for
+# MAGIC a future iteration rather than solving it now.
+
+# COMMAND ----------
+
+df_event_drug = (
+    df_events_dedup
+    .select("safety_report_id", "drug_array")
+    .withColumn("drug", F.explode("drug_array"))
+    .select(
+        "safety_report_id",
+        F.trim(F.col("drug.medicinalproduct")).alias("medicinal_product_name"),
+        F.col("drug.drugcharacterization").alias("drug_characterization_code"),
+        F.col("drug.drugdosagetext").alias("drug_dosage_text"),
+        F.col("drug.drugadministrationroute").alias("drug_administration_route_code"),
+        F.col("drug.drugindication").alias("drug_indication"),
+        F.col("drug.actiondrug").alias("action_taken_with_drug_code"),
+        F.to_date(F.col("drug.drugstartdate"), "yyyyMMdd").alias("drug_start_date"),
+        F.to_date(F.col("drug.drugenddate"), "yyyyMMdd").alias("drug_end_date"),
+        F.col("drug.openfda.generic_name")[0].alias("generic_name"),
+        F.col("drug.openfda.brand_name")[0].alias("brand_name"),
+        F.col("drug.openfda.manufacturer_name")[0].alias("manufacturer_name"),
     )
-    if openfda_api_key:
-        api_url += f"&api_key={openfda_api_key}"
-    try:
-        response = requests.get(api_url, headers=request_headers, timeout=30)
-        if response.status_code == 404:
-            # OpenFDA returns 404 when a query matches zero records — not an error
-            return {"meta": {"results": {"total": 0}}, "results": []}
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        if retries_left > 0:
-            print(f"    Request failed ({e}), retrying... ({retries_left} left)")
-            time.sleep(2)
-            return fetch_page(search_query, skip, limit, retries_left - 1)
-        else:
-            print(f"    Request failed after all retries: {e}")
-            raise
+    .filter(F.col("medicinal_product_name").isNotNull())
+    .dropDuplicates()  # guards against exact duplicate drug entries within the same report
+)
+
+print("silver_event_drug row count:", df_event_drug.count())
+df_event_drug.show(5, truncate=50)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 3 — Helper: upload one page as a blob
+# MAGIC ## Step 6 — Build `silver_event_reaction` (explode `reaction[]`)
 # MAGIC
-# MAGIC Path pattern: `adverse_events/{year}/{month:02d}/events_{week_start}_part{n}.json`
-# MAGIC — this is exactly the partitioned structure your Silver notebook's wildcard
-# MAGIC path (`adverse_events/*/*/*.json`) expects.
+# MAGIC Same pattern as drugs. MedDRA reaction terms (`reactionmeddrapt`) are notoriously
+# MAGIC inconsistent in casing/spacing across reports, so we standardize with
+# MAGIC `trim()` + `upper()` — this matters a lot once you're grouping/counting reactions
+# MAGIC in Gold; inconsistent casing would silently split what should be one reaction into
+# MAGIC multiple rows.
 
 # COMMAND ----------
 
-def upload_page(json_data, week_start, part_number):
-    year = week_start.year
-    month = week_start.month
-    blob_path = f"adverse_events/{year}/{month:02d}/events_{week_start.isoformat()}_part{part_number}.json"
+df_event_reaction = (
+    df_events_dedup
+    .select("safety_report_id", "reaction_array")
+    .withColumn("reaction", F.explode("reaction_array"))
+    .select(
+        "safety_report_id",
+        F.upper(F.trim(F.col("reaction.reactionmeddrapt"))).alias("reaction_term"),
+        F.col("reaction.reactionoutcome").alias("reaction_outcome_code"),
+    )
+    .filter(F.col("reaction_term").isNotNull())
+    .dropDuplicates()
+)
 
-    blob_client = container_client.get_blob_client(blob_path)
-    blob_client.upload_blob(json.dumps(json_data), overwrite=True)
-    return blob_path
+print("silver_event_reaction row count:", df_event_reaction.count())
+df_event_reaction.show(5, truncate=50)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 3b — Helper: check if a week was already ingested
+# MAGIC ## Step 7 — Finalize `silver_events` (drop the now-redundant arrays)
 # MAGIC
-# MAGIC Looks for any blob whose name starts with this week's prefix
-# MAGIC (`adverse_events/{year}/{month}/events_{week_start}_part`). If even one exists,
-# MAGIC we treat the whole week as already done and skip it — cheap check (one API call
-# MAGIC to storage), no OpenFDA requests spent on it at all.
+# MAGIC The `drug_array` / `reaction_array` columns have done their job feeding Steps 5-6.
+# MAGIC We drop them here so `silver_events` stays at a clean one-row-per-report grain with
+# MAGIC no leftover nested structures — this is what will become `Fact_Adverse_Event` +
+# MAGIC `Dim_Patient` in Gold.
+# MAGIC
+# MAGIC We also add `event_year` / `event_month` columns purely to partition the Delta
+# MAGIC write — this lets future queries (and Power BI's DirectQuery/Import refreshes)
+# MAGIC skip irrelevant partitions instead of scanning the whole table, a technique called
+# MAGIC **partition pruning**.
 
 # COMMAND ----------
 
-def week_already_ingested(week_start):
-    year = week_start.year
-    month = week_start.month
-    prefix = f"adverse_events/{year}/{month:02d}/events_{week_start.isoformat()}_part"
-    existing = list(container_client.list_blobs(name_starts_with=prefix))
-    return len(existing) > 0
+df_silver_events = (
+    df_events_dedup
+    .drop("drug_array", "reaction_array")
+    .withColumn("event_year", F.year("received_date"))
+    .withColumn("event_month", F.month("received_date"))
+)
+
+print("silver_events row count:", df_silver_events.count())
+df_silver_events.printSchema()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 4 — Main ingestion loop
+# MAGIC ## Step 8 — Write all three tables to Silver as Delta
 # MAGIC
-# MAGIC For each week: query the total record count first (from `meta.results.total`),
-# MAGIC then page through with `skip` in steps of `page_limit` until either all records
-# MAGIC are pulled or we hit `max_skip_per_query`. If a week hits that ceiling, it's
-# MAGIC flagged in the summary so you know that week's data may be incomplete and could
-# MAGIC be re-pulled in daily chunks later.
+# MAGIC Notes on choices below:
+# MAGIC - `.format("delta")` — gives you ACID-safe writes (no half-written table if a job
+# MAGIC   fails midway) and the ability to time-travel to previous versions if you ever
+# MAGIC   need to debug what the data looked like on a prior run.
+# MAGIC - `.coalesce(n)` — forces Spark to consolidate output into a small, fixed number
+# MAGIC   of files rather than one-file-per-task. Critical on a single-node free-tier
+# MAGIC   cluster where you want to minimize storage transaction costs and avoid
+# MAGIC   slow listing operations later.
+# MAGIC - `mode("overwrite")` — simplest correct choice for now while you're iterating.
+# MAGIC   Once this pipeline is scheduled to run repeatedly, revisit this: overwrite
+# MAGIC   discards history each run, so you'll want either an append + dedupe-on-read
+# MAGIC   pattern or a Delta `MERGE` (upsert) — a good next lesson once Silver is stable.
 
 # COMMAND ----------
 
-ingestion_log = []
+(
+    df_silver_events
+    .coalesce(4)
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .partitionBy("event_year", "event_month")
+    .option("overwriteSchema", "true")
+    .save(silver_events_path)
+)
+print("silver_events written to:", silver_events_path)
 
-for week_start, week_end in weekly_ranges:
-    print(f"\nWeek {week_start} to {week_end}")
+# COMMAND ----------
 
-    if skip_existing and week_already_ingested(week_start):
-        print("  Already ingested — skipping (no OpenFDA calls made).")
-        ingestion_log.append({"week_start": str(week_start), "records": "skipped", "pages": "skipped", "hit_ceiling": False})
-        continue
+(
+    df_event_drug
+    .coalesce(2)
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(silver_event_drug_path)
+)
+print("silver_event_drug written to:", silver_event_drug_path)
 
-    search_query = f"receiptdate:[{week_start.strftime('%Y%m%d')}+TO+{week_end.strftime('%Y%m%d')}]"
+# COMMAND ----------
 
-    # First request tells us the total record count for this week via meta.results.total
-    first_page = fetch_page(search_query, skip=0, limit=page_limit)
-    total_available = first_page.get("meta", {}).get("results", {}).get("total", 0)
-    print(f"  Total records available: {total_available}")
-
-    if total_available == 0:
-        ingestion_log.append({"week_start": str(week_start), "records": 0, "pages": 0, "hit_ceiling": False})
-        continue
-
-    hit_ceiling = total_available > max_skip_per_query
-    if hit_ceiling:
-        print(f"  WARNING: this week has more records than the {max_skip_per_query} pagination ceiling.")
-        print(f"  Only the first {max_skip_per_query} will be pulled. Consider daily chunks for this week later.")
-
-    records_pulled = 0
-    part_number = 0
-    skip = 0
-
-    # Upload the first page we already fetched above
-    results = first_page.get("results", [])
-    if results:
-        blob_path = upload_page(first_page, week_start, part_number)
-        records_pulled += len(results)
-        part_number += 1
-        print(f"    Wrote part {part_number}: {len(results)} records -> {blob_path}")
-
-    skip = page_limit
-    while skip < min(total_available, max_skip_per_query):
-        time.sleep(request_pause_seconds)
-        page = fetch_page(search_query, skip=skip, limit=page_limit)
-        results = page.get("results", [])
-        if not results:
-            break
-        blob_path = upload_page(page, week_start, part_number)
-        records_pulled += len(results)
-        part_number += 1
-        print(f"    Wrote part {part_number}: {len(results)} records -> {blob_path}")
-        skip += page_limit
-
-    ingestion_log.append({
-        "week_start": str(week_start),
-        "records": records_pulled,
-        "pages": part_number,
-        "hit_ceiling": hit_ceiling,
-    })
+(
+    df_event_reaction
+    .coalesce(2)
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(silver_event_reaction_path)
+)
+print("silver_event_reaction written to:", silver_event_reaction_path)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 5 — Summary
+# MAGIC ## Step 9 — (Optional but recommended) Register as metastore tables
 # MAGIC
-# MAGIC Quick sanity check before moving to Silver — total records pulled, and a flag
-# MAGIC for any week that hit the pagination ceiling and may need a follow-up daily pull.
+# MAGIC Registering the Delta paths as named tables lets you query them with plain SQL
+# MAGIC (`SELECT * FROM silver.events`) instead of always referencing the ADLS path —
+# MAGIC handy for ad-hoc checks and for Power BI's Databricks connector later.
 
 # COMMAND ----------
 
-skipped_weeks = [w["week_start"] for w in ingestion_log if w["records"] == "skipped"]
-processed = [w for w in ingestion_log if w["records"] != "skipped"]
+spark.sql("CREATE DATABASE IF NOT EXISTS silver")
 
-total_records = sum(w["records"] for w in processed)
-total_pages = sum(w["pages"] for w in processed)
-weeks_at_ceiling = [w["week_start"] for w in processed if w["hit_ceiling"]]
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS silver.events
+    USING DELTA
+    LOCATION '{silver_events_path}'
+""")
 
-print("=== Ingestion summary ===")
-print(f"Weeks total: {len(ingestion_log)} | skipped (already existed): {len(skipped_weeks)} | newly processed: {len(processed)}")
-print(f"Total records written this run: {total_records}")
-print(f"Total JSON files written this run: {total_pages}")
-print(f"Weeks that hit the pagination ceiling: {weeks_at_ceiling if weeks_at_ceiling else 'none'}")
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS silver.event_drug
+    USING DELTA
+    LOCATION '{silver_event_drug_path}'
+""")
 
-if total_pages == 0 and len(skipped_weeks) == len(ingestion_log):
-    print("\nNo new files written this run — every requested week already exists in Bronze.")
-    print("Nothing to do. If you want a fresh pull anyway, set skip_existing = False above and re-run.")
-elif total_pages == 0:
-    print("\nNo new files were written this run, but not all weeks were skipped — check the log above for weeks with zero available records.")
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS silver.event_reaction
+    USING DELTA
+    LOCATION '{silver_event_reaction_path}'
+""")
+
+print("Silver tables registered in metastore: silver.events, silver.event_drug, silver.event_reaction")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Recap & next steps
+# MAGIC ## Step 10 — Sanity checks
 # MAGIC
-# MAGIC Bronze now has a properly partitioned dataset at
-# MAGIC `bronze/adverse_events/YYYY/MM/events_{week}_part{n}.json` spanning your
-# MAGIC configured date range — ready for the Silver notebook's wildcard read path
-# MAGIC exactly as originally designed, no changes needed there.
+# MAGIC Quick validation before you move on to Gold. Worth running every time you
+# MAGIC re-execute this notebook.
+
+# COMMAND ----------
+
+print("=== Row counts ===")
+print("silver.events:         ", spark.table("silver.events").count())
+print("silver.event_drug:     ", spark.table("silver.event_drug").count())
+print("silver.event_reaction: ", spark.table("silver.event_reaction").count())
+
+print("\n=== Null checks on key columns ===")
+spark.table("silver.events").select(
+    F.sum(F.col("safety_report_id").isNull().cast("int")).alias("null_safety_report_ids"),
+    F.sum(F.col("received_date").isNull().cast("int")).alias("null_received_dates"),
+).show()
+
+print("\n=== Sample joined view (event -> drug -> reaction) ===")
+spark.sql("""
+    SELECT e.safety_report_id, e.received_date, e.patient_sex_code,
+           d.generic_name, d.brand_name,
+           r.reaction_term
+    FROM silver.events e
+    JOIN silver.event_drug d ON e.safety_report_id = d.safety_report_id
+    JOIN silver.event_reaction r ON e.safety_report_id = r.safety_report_id
+    LIMIT 10
+""").show(truncate=40)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Recap & what's next
 # MAGIC
-# MAGIC If any weeks hit the pagination ceiling, note them — a good future exercise is
-# MAGIC re-running just those weeks in daily chunks instead of weekly, to guarantee full
-# MAGIC coverage even on unusually high-volume weeks.
+# MAGIC You now have three clean, deduplicated, typed Delta tables in Silver:
+# MAGIC - `silver.events` — partitioned by year/month, ready to become `Fact_Adverse_Event` + `Dim_Patient`
+# MAGIC - `silver.event_drug` — ready to become `Bridge_Event_Drug` + `Dim_Drug`
+# MAGIC - `silver.event_reaction` — ready to become `Bridge_Event_Reaction` + `Dim_Reaction`
+# MAGIC
+# MAGIC **Next notebook (Gold layer)** will:
+# MAGIC 1. Deduplicate `generic_name` / `manufacturer_name` / `reaction_term` into proper
+# MAGIC    dimension tables with surrogate keys (matching your existing SCM star schema
+# MAGIC    conventions).
+# MAGIC 2. Build `Dim_Date` (you already have a pattern for this from your SCM work).
+# MAGIC 3. Collapse `silver.event_drug` / `silver.event_reaction` into the bridge tables
+# MAGIC    using surrogate keys instead of raw text.
+# MAGIC 4. Revisit the `overwrite` mode above and introduce an incremental `MERGE` pattern
+# MAGIC    once you're running this on a schedule.
