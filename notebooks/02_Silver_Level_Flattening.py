@@ -34,22 +34,18 @@ from pyspark.sql import functions as F
 # --- Storage account / container config ---
 storage_account = "pharmacovigilance01"
 secret_scope = "pharmacovigilance"
-secret_key_name = "adls_pharmacovigilance01_key"   # <-- update this to match the exact key name you used when saving the secret
+secret_key_name = "adls_pharmacovigilance01_key"
 
 bronze_container = "bronze"
 silver_container = "silver"
-
-# Tell Spark how to authenticate against this specific storage account using the access key
-spark.conf.set(
-    f"fs.azure.account.key.{storage_account}.dfs.core.windows.net",
-    dbutils.secrets.get(scope=secret_scope, key=secret_key_name)
-)
 
 # abfss:// is the ADLS Gen2 driver — required since your storage account is Gen2, not plain Blob
 bronze_path = f"abfss://{bronze_container}@{storage_account}.dfs.core.windows.net/adverse_events/*/*/*.json"
 silver_events_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/events"
 silver_event_drug_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/event_drug"
 silver_event_reaction_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/event_reaction"
+
+
 
 print("Bronze read path:", bronze_path)
 
@@ -70,7 +66,7 @@ print("Bronze read path:", bronze_path)
 
 # COMMAND ----------
 
-force_refresh = False
+force_refresh = True
 
 silver_tables_exist = all(
     spark.catalog.tableExists(t) for t in ["silver.events", "silver.event_drug", "silver.event_reaction"]
@@ -193,7 +189,9 @@ print(f"Rows before dedup: {before_count} | after dedup: {after_count} | duplica
 
 # Cache this, since we're about to reuse it three times below (once per output table).
 # Caching avoids Spark re-reading and re-parsing all the raw JSON from scratch each time.
-df_events_dedup.cache()
+# NOTE: .cache() is commented out — Serverless compute doesn't support persisting
+# data in memory across cells the way a dedicated cluster does.
+# df_events_dedup.cache()
 
 # COMMAND ----------
 
