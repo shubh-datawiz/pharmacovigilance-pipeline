@@ -34,7 +34,7 @@ from pyspark.sql import functions as F
 # --- Storage account / container config ---
 storage_account = "pharmacovigilance01"
 secret_scope = "pharmacovigilance"
-secret_key_name = "storage-access-key"   # <-- update this to match the exact key name you used when saving the secret
+secret_key_name = "adls_pharmacovigilance01_key"   # <-- update this to match the exact key name you used when saving the secret
 
 bronze_container = "bronze"
 silver_container = "silver"
