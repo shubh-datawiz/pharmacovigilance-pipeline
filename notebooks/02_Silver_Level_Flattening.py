@@ -66,7 +66,7 @@ print("Bronze read path:", bronze_path)
 
 # COMMAND ----------
 
-force_refresh = True
+force_refresh = False
 
 silver_tables_exist = all(
     spark.catalog.tableExists(t) for t in ["silver.events", "silver.event_drug", "silver.event_reaction"]
