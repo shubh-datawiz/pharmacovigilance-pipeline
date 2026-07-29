@@ -1,0 +1,6 @@
+.venv/
+typings/
+.databricks/
+__pycache__/
+*.pyc
+.vscode/settings.json
