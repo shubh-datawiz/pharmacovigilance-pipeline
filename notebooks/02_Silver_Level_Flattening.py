@@ -132,7 +132,7 @@ df_raw_all = (
     .option("mode", "PERMISSIVE")
     .option("columnNameOfCorruptRecord", "_corrupt_record")
     .json(bronze_path)
-    .withColumn("_source_file", input_file_name())
+    .withColumn("_source_file", F.col("_metadata.file_path"))
 )
 
 df_raw = df_raw_all.filter(df_raw_all["_source_file"].isin(new_bronze_files))
