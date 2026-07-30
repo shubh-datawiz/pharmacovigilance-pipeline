@@ -137,7 +137,7 @@ df_raw_all = (
 
 df_raw = df_raw_all.filter(df_raw_all["_source_file"].isin(new_bronze_files))
 
-print("Files parsed. Row count (1 row = 1 raw API response file):", df_raw.count())
+print("Files have been parsed. Row count (1 row = 1 raw API response file):", df_raw.count())
 df_raw.printSchema()
 
 # COMMAND ----------
@@ -213,10 +213,19 @@ df_events_flat = df_events_exploded.select(
 
 before_count = df_events_flat.count()
 
-df_events_dedup = df_events_flat.dropDuplicates(["safety_report_id"])
+# First, dedupe within this run's own batch
+df_events_dedup_local = df_events_flat.dropDuplicates(["safety_report_id"])
+
+# Then, exclude any safety_report_id that's already in the target table
+# (protects against the same report appearing in a later incremental run's Bronze files)
+if spark.catalog.tableExists("silver.events"):
+    existing_ids = spark.table("silver.events").select("safety_report_id")
+    df_events_dedup = df_events_dedup_local.join(existing_ids, on="safety_report_id", how="left_anti")
+else:
+    df_events_dedup = df_events_dedup_local
 
 after_count = df_events_dedup.count()
-print(f"Rows before dedup: {before_count} | after dedup: {after_count} | duplicates removed: {before_count - after_count}")
+print(f"Rows before dedup: {before_count} | after local dedup: {df_events_dedup_local.count()} | after excluding existing: {after_count}")
 
 # Cache this, since we're about to reuse it three times below (once per output table).
 # Caching avoids Spark re-reading and re-parsing all the raw JSON from scratch each time.
