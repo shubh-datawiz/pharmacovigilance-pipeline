@@ -38,7 +38,7 @@ secret_scope = "pharmacovigilance"
 secret_key_name = "adls_pharmacovigilance01_key"
 
 start_date = date(2024, 1, 1)
-end_date = date(2024, 4, 12)   # ~13 weeks + 10 days of data — a reasonable first real pull
+end_date = date(2024, 4, 13)   # ~13 weeks + 10 days of data — a reasonable first real pull
 
 page_limit = 1000              # OpenFDA's max records per request
 max_skip_per_query = 25000     # OpenFDA's hard ceiling on skip + limit combined
