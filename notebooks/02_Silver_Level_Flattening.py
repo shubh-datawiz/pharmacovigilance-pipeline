@@ -66,21 +66,47 @@ print("Bronze read path:", bronze_path)
 
 # COMMAND ----------
 
-force_refresh = False
+# --- Incremental load control table ---
+# Tracks which Bronze files have already been processed into Silver, so re-runs
+# only pick up genuinely new files instead of reprocessing everything.
 
-silver_tables_exist = all(
-    spark.catalog.tableExists(t) for t in ["silver.events", "silver.event_drug", "silver.event_reaction"]
+spark.sql("CREATE SCHEMA IF NOT EXISTS silver")
+
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS silver.load_log (
+        file_path STRING,
+        loaded_at TIMESTAMP
+    ) USING DELTA
+""")
+
+def list_bronze_files(base_path):
+    """Recursively lists all .json files under adverse_events/YYYY/MM/"""
+    files = []
+    for year_dir in dbutils.fs.ls(base_path):
+        if year_dir.isDir():
+            for month_dir in dbutils.fs.ls(year_dir.path):
+                if month_dir.isDir():
+                    for f in dbutils.fs.ls(month_dir.path):
+                        if f.path.endswith(".json"):
+                            files.append(f.path)
+    return files
+
+bronze_base_path = f"abfss://{bronze_container}@{storage_account}.dfs.core.windows.net/adverse_events/"
+all_bronze_files = list_bronze_files(bronze_base_path)
+
+already_loaded_files = set(
+    row.file_path for row in spark.table("silver.load_log").select("file_path").collect()
 )
 
-if silver_tables_exist and not force_refresh:
-    print("Silver tables already exist and force_refresh is False — skipping the rebuild.")
-    print("Set force_refresh = True above and re-run if you need a fresh build (e.g. after new Bronze data).")
-    dbutils.notebook.exit("Skipped: Silver tables already exist")
-else:
-    if not silver_tables_exist:
-        print("Silver tables not found — proceeding with full build.")
-    else:
-        print("force_refresh is True — proceeding with full rebuild despite existing tables.")
+new_bronze_files = [f for f in all_bronze_files if f not in already_loaded_files]
+
+print(f"Total Bronze files found: {len(all_bronze_files)}")
+print(f"Already processed (in load_log): {len(already_loaded_files)}")
+print(f"New files to process this run: {len(new_bronze_files)}")
+
+if not new_bronze_files:
+    print("No new Bronze files since last run — nothing to do.")
+    dbutils.notebook.exit("Skipped: no new Bronze files found")
 
 # COMMAND ----------
 
@@ -98,13 +124,18 @@ else:
 
 # COMMAND ----------
 
-df_raw = (
+from pyspark.sql.functions import input_file_name
+
+df_raw_all = (
     spark.read
     .option("multiline", "true")
     .option("mode", "PERMISSIVE")
     .option("columnNameOfCorruptRecord", "_corrupt_record")
     .json(bronze_path)
+    .withColumn("_source_file", input_file_name())
 )
+
+df_raw = df_raw_all.filter(df_raw_all["_source_file"].isin(new_bronze_files))
 
 print("Files parsed. Row count (1 row = 1 raw API response file):", df_raw.count())
 df_raw.printSchema()
@@ -315,9 +346,8 @@ df_silver_events.printSchema()
     .coalesce(4)
     .write
     .format("delta")
-    .mode("overwrite")
+    .mode("append")
     .partitionBy("event_year", "event_month")
-    .option("overwriteSchema", "true")
     .save(silver_events_path)
 )
 print("silver_events written to:", silver_events_path)
@@ -329,8 +359,7 @@ print("silver_events written to:", silver_events_path)
     .coalesce(2)
     .write
     .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
+    .mode("append")
     .save(silver_event_drug_path)
 )
 print("silver_event_drug written to:", silver_event_drug_path)
@@ -342,11 +371,30 @@ print("silver_event_drug written to:", silver_event_drug_path)
     .coalesce(2)
     .write
     .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
+    .mode("append")
     .save(silver_event_reaction_path)
 )
 print("silver_event_reaction written to:", silver_event_reaction_path)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 8b — Log processed files
+# MAGIC
+# MAGIC Marks this run's files as done, so the next run's incremental check
+# MAGIC correctly skips them.
+
+# COMMAND ----------
+
+import datetime
+from pyspark.sql import Row
+
+new_log_df = spark.createDataFrame(
+    [Row(file_path=f, loaded_at=datetime.datetime.now()) for f in new_bronze_files]
+)
+new_log_df.write.format("delta").mode("append").saveAsTable("silver.load_log")
+
+print(f"Logged {len(new_bronze_files)} files as processed in silver.load_log")
 
 # COMMAND ----------
 
