@@ -38,7 +38,7 @@ secret_scope = "pharmacovigilance"
 secret_key_name = "adls_pharmacovigilance01_key"
 
 start_date = date(2024, 1, 1)
-end_date = date(2024, 4, 13)   # ~13 weeks + 10 days of data — a reasonable first real pull
+end_date = date(2024, 4, 14)   # ~13 weeks + 10 days of data — a reasonable first real pull
 
 page_limit = 1000              # OpenFDA's max records per request
 max_skip_per_query = 25000     # OpenFDA's hard ceiling on skip + limit combined
@@ -187,13 +187,20 @@ def week_already_ingested(week_start):
 
 ingestion_log = []
 
-for week_start, week_end in weekly_ranges:
+for i, (week_start, week_end) in enumerate(weekly_ranges):
+    is_most_recent_week = (i == len(weekly_ranges) - 1)
     print(f"\nWeek {week_start} to {week_end}")
 
-    if skip_existing and week_already_ingested(week_start):
+    # The most recent chunk is always re-fetched, even if skip_existing is True —
+    # this protects against end_date having grown since the last run (e.g. adding
+    # a few more days within the same week). Blob uploads use overwrite=True below,
+    # so re-fetching already-known days is harmless and just re-writes the same data.
+    if skip_existing and not is_most_recent_week and week_already_ingested(week_start):
         print("  Already ingested — skipping (no OpenFDA calls made).")
         ingestion_log.append({"week_start": str(week_start), "records": "skipped", "pages": "skipped", "hit_ceiling": False})
         continue
+    elif is_most_recent_week and skip_existing:
+        print("  Most recent week — always re-fetched, even if files already exist.")
 
     search_query = f"receiptdate:[{week_start.strftime('%Y%m%d')}+TO+{week_end.strftime('%Y%m%d')}]"
 
