@@ -38,7 +38,7 @@ secret_scope = "pharmacovigilance"
 secret_key_name = "adls_pharmacovigilance01_key"
 
 start_date = date(2024, 1, 1)
-end_date = date(2024, 4, 14)   # ~13 weeks + 10 days of data — a reasonable first real pull
+end_date = date(2024, 4, 16)   # ~13 weeks + 10 days of data — a reasonable first real pull
 
 page_limit = 1000              # OpenFDA's max records per request
 max_skip_per_query = 25000     # OpenFDA's hard ceiling on skip + limit combined
@@ -306,6 +306,11 @@ print(f"Weeks total: {len(ingestion_log)} | skipped (already existed): {len(skip
 print(f"Total records written this run: {total_records}")
 print(f"Total JSON files written this run: {total_pages}")
 print(f"Weeks that hit the pagination ceiling: {weeks_at_ceiling if weeks_at_ceiling else 'none'}")
+
+# Only persist the new end_date after a successful run, so a failed/partial
+# run doesn't falsely mark this end_date as "already handled" for next time.
+write_last_end_date(end_date)
+print(f"\nSaved end_date={end_date} as this run's checkpoint for next time.")
 
 # COMMAND ----------
 
