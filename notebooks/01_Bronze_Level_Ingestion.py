@@ -175,6 +175,38 @@ def week_already_ingested(week_start):
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Step 3c — Helper: track last run's end_date
+# MAGIC
+# MAGIC A tiny metadata blob remembers what `end_date` was used last time. This lets us
+# MAGIC tell the difference between "re-running with the same config" (safe to skip the
+# MAGIC most recent week too) and "end_date was extended" (only then re-fetch the most
+# MAGIC recent week, to pick up the newly added days).
+
+# COMMAND ----------
+
+metadata_blob_path = "adverse_events/_metadata/last_run.json"
+
+def read_last_end_date():
+    blob_client = container_client.get_blob_client(metadata_blob_path)
+    if blob_client.exists():
+        content = blob_client.download_blob().readall()
+        return date.fromisoformat(json.loads(content)["end_date"])
+    return None
+
+def write_last_end_date(value):
+    blob_client = container_client.get_blob_client(metadata_blob_path)
+    blob_client.upload_blob(json.dumps({"end_date": value.isoformat()}), overwrite=True)
+
+last_end_date = read_last_end_date()
+end_date_changed = (last_end_date is None) or (end_date != last_end_date)
+
+print(f"Last run's end_date: {last_end_date}")
+print(f"This run's end_date: {end_date}")
+print(f"end_date changed since last run: {end_date_changed}")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Step 4 — Main ingestion loop
 # MAGIC
 # MAGIC For each week: query the total record count first (from `meta.results.total`),
@@ -191,16 +223,18 @@ for i, (week_start, week_end) in enumerate(weekly_ranges):
     is_most_recent_week = (i == len(weekly_ranges) - 1)
     print(f"\nWeek {week_start} to {week_end}")
 
-    # The most recent chunk is always re-fetched, even if skip_existing is True —
-    # this protects against end_date having grown since the last run (e.g. adding
-    # a few more days within the same week). Blob uploads use overwrite=True below,
-    # so re-fetching already-known days is harmless and just re-writes the same data.
-    if skip_existing and not is_most_recent_week and week_already_ingested(week_start):
+    # The most recent chunk only gets a "free pass" past skip_existing when
+    # end_date has actually changed since the last run — otherwise it's skipped
+    # just like any other already-ingested week, avoiding wasted OpenFDA calls
+    # on repeat runs with the same config.
+    force_refetch_this_week = is_most_recent_week and end_date_changed
+
+    if skip_existing and not force_refetch_this_week and week_already_ingested(week_start):
         print("  Already ingested — skipping (no OpenFDA calls made).")
         ingestion_log.append({"week_start": str(week_start), "records": "skipped", "pages": "skipped", "hit_ceiling": False})
         continue
-    elif is_most_recent_week and skip_existing:
-        print("  Most recent week — always re-fetched, even if files already exist.")
+    elif force_refetch_this_week:
+        print("  Most recent week — end_date changed since last run, re-fetching to capture new days.")
 
     search_query = f"receiptdate:[{week_start.strftime('%Y%m%d')}+TO+{week_end.strftime('%Y%m%d')}]"
 
