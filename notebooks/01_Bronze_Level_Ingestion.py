@@ -1,86 +1,59 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Bronze Layer — OpenFDA Adverse Events (Full Ingestion)
-# MAGIC ### Pharmacovigilance & Regulatory Compliance Pipeline
+# MAGIC ### Pharmacovigilance & Regulatory Compliance Pipeline — Databricks Free Edition
 # MAGIC
-# MAGIC Upgrades the earlier single-file test script into a real ingestion job:
-# MAGIC - Loops across a date range in **weekly chunks** (keeps each query's result count
-# MAGIC   safely under OpenFDA's 25,000 skip+limit ceiling)
-# MAGIC - **Paginates** within each week using `limit` + `skip` until all matching records
-# MAGIC   for that week are pulled
-# MAGIC - **Rate-limits** itself with small pauses and retries failed requests
-# MAGIC - Writes each page as its own JSON blob into `bronze/adverse_events/YYYY/MM/...`
-# MAGIC   using the `azure-storage-blob` SDK directly — this bypasses Spark entirely,
-# MAGIC   so it works the same whether you're on Serverless or a cluster.
+# MAGIC Migrated from Azure Blob Storage to Unity Catalog Volumes — no cloud storage
+# MAGIC account needed. Files are written directly to a managed Volume, which is a
+# MAGIC POSIX-style file path Databricks provides for free within Unity Catalog.
 
 # COMMAND ----------
 
 import requests
 import json
+import os
 import time
-from azure.storage.blob import BlobServiceClient
 from datetime import date, timedelta
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Step 0 — Config
-# MAGIC
-# MAGIC Adjust `start_date` / `end_date` to control how much history you pull. Wider
-# MAGIC ranges mean more requests and longer runtime — start with a few months while
-# MAGIC you're validating, then widen once you're confident it's stable.
 
 # COMMAND ----------
 
-storage_account_name = "pharmacovigilance01"
-container_name = "bronze"
+catalog_name = "pharmacovigilance_ws"
+bronze_schema = "bronze"
+volume_name = "raw_adverse_events"
+
+# This is the Volume's root path — behaves like a normal filesystem path
+volume_root = f"/Volumes/{catalog_name}/{bronze_schema}/{volume_name}"
+
 secret_scope = "pharmacovigilance"
-secret_key_name = "adls_pharmacovigilance01_key"
 
 start_date = date(2024, 1, 1)
-end_date = date(2024, 4, 16)   # ~13 weeks + 10 days of data — a reasonable first real pull
+end_date = date(2024, 4, 16)
 
-page_limit = 1000              # OpenFDA's max records per request
-max_skip_per_query = 25000     # OpenFDA's hard ceiling on skip + limit combined
-request_pause_seconds = 0.3    # small pause between requests, stays well under rate limits
+page_limit = 1000
+max_skip_per_query = 25000
+request_pause_seconds = 0.3
 max_retries = 3
 
-# Optional but recommended: get a free key at https://open.fda.gov/apis/authentication/
-# Raises your rate limit and makes 403 bot-protection blocks far less likely.
-# Leave as None to run without one.
 openfda_api_key = dbutils.secrets.get(scope=secret_scope, key="openfda_api_key")
 
-# If True, weeks that already have files in Bronze are skipped entirely — no OpenFDA
-# calls made for them at all. Set to False to force a full re-pull of every week
-# regardless of what's already there (e.g. if you suspect a prior run was incomplete).
 skip_existing = True
 
-# A default requests User-Agent (python-requests/x.x) can get blocked by OpenFDA's
-# edge bot-protection with a 403, even though nothing is actually wrong with the
-# request itself. Sending a normal browser-style header avoids this.
 request_headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# COMMAND ----------
-
-access_key = dbutils.secrets.get(scope=secret_scope, key=secret_key_name)
-blob_service_client = BlobServiceClient(
-    account_url=f"https://{storage_account_name}.blob.core.windows.net",
-    credential=access_key
-)
-container_client = blob_service_client.get_container_client(container_name)
-
-print("Connected to storage account:", storage_account_name)
+print("Volume root path:", volume_root)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 1 — Build the list of weekly date ranges to pull
-# MAGIC
-# MAGIC OpenFDA's `receiptdate` field uses `YYYYMMDD` format inside the search query.
-# MAGIC We generate `[start, end)` pairs one week apart, from `start_date` to `end_date`.
+# MAGIC ## Step 1 — Weekly date ranges
 
 # COMMAND ----------
 
@@ -95,18 +68,11 @@ def generate_weekly_ranges(start, end):
 
 weekly_ranges = generate_weekly_ranges(start_date, end_date)
 print(f"Generated {len(weekly_ranges)} weekly chunks from {start_date} to {end_date}")
-for r in weekly_ranges[:3]:
-    print(" ", r)
-print("  ...")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 2 — Helper: fetch one page, with retries
-# MAGIC
-# MAGIC A single function that hits the API once and retries on transient failures
-# MAGIC (network blips, momentary 5xx errors from OpenFDA). It does NOT retry on a
-# MAGIC clean "no results" response — that's a valid outcome, not a failure.
+# MAGIC ## Step 2 — Fetch one page, with retries
 
 # COMMAND ----------
 
@@ -120,7 +86,6 @@ def fetch_page(search_query, skip, limit, retries_left=max_retries):
     try:
         response = requests.get(api_url, headers=request_headers, timeout=30)
         if response.status_code == 404:
-            # OpenFDA returns 404 when a query matches zero records — not an error
             return {"meta": {"results": {"total": 0}}, "results": []}
         response.raise_for_status()
         return response.json()
@@ -136,66 +101,59 @@ def fetch_page(search_query, skip, limit, retries_left=max_retries):
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 3 — Helper: upload one page as a blob
+# MAGIC ## Step 3 — Write one page to the Volume
 # MAGIC
-# MAGIC Path pattern: `adverse_events/{year}/{month:02d}/events_{week_start}_part{n}.json`
-# MAGIC — this is exactly the partitioned structure your Silver notebook's wildcard
-# MAGIC path (`adverse_events/*/*/*.json`) expects.
+# MAGIC `/Volumes/...` paths support normal Python file I/O — `os.makedirs` and
+# MAGIC `open()` work exactly like a local filesystem. No SDK, no credentials.
 
 # COMMAND ----------
 
 def upload_page(json_data, week_start, part_number):
     year = week_start.year
     month = week_start.month
-    blob_path = f"adverse_events/{year}/{month:02d}/events_{week_start.isoformat()}_part{part_number}.json"
+    dir_path = f"{volume_root}/adverse_events/{year}/{month:02d}"
+    os.makedirs(dir_path, exist_ok=True)
 
-    blob_client = container_client.get_blob_client(blob_path)
-    blob_client.upload_blob(json.dumps(json_data), overwrite=True)
-    return blob_path
+    file_path = f"{dir_path}/events_{week_start.isoformat()}_part{part_number}.json"
+    with open(file_path, "w") as f:
+        json.dump(json_data, f)
+    return file_path
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 3b — Helper: check if a week was already ingested
-# MAGIC
-# MAGIC Looks for any blob whose name starts with this week's prefix
-# MAGIC (`adverse_events/{year}/{month}/events_{week_start}_part`). If even one exists,
-# MAGIC we treat the whole week as already done and skip it — cheap check (one API call
-# MAGIC to storage), no OpenFDA requests spent on it at all.
+# MAGIC ## Step 3b — Check if a week was already ingested
 
 # COMMAND ----------
 
 def week_already_ingested(week_start):
     year = week_start.year
     month = week_start.month
-    prefix = f"adverse_events/{year}/{month:02d}/events_{week_start.isoformat()}_part"
-    existing = list(container_client.list_blobs(name_starts_with=prefix))
-    return len(existing) > 0
+    dir_path = f"{volume_root}/adverse_events/{year}/{month:02d}"
+    prefix = f"events_{week_start.isoformat()}_part"
+    if not os.path.isdir(dir_path):
+        return False
+    return any(f.startswith(prefix) for f in os.listdir(dir_path))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 3c — Helper: track last run's end_date
-# MAGIC
-# MAGIC A tiny metadata blob remembers what `end_date` was used last time. This lets us
-# MAGIC tell the difference between "re-running with the same config" (safe to skip the
-# MAGIC most recent week too) and "end_date was extended" (only then re-fetch the most
-# MAGIC recent week, to pick up the newly added days).
+# MAGIC ## Step 3c — Track last run's end_date
 
 # COMMAND ----------
 
-metadata_blob_path = "adverse_events/_metadata/last_run.json"
+metadata_file_path = f"{volume_root}/_metadata/last_run.json"
 
 def read_last_end_date():
-    blob_client = container_client.get_blob_client(metadata_blob_path)
-    if blob_client.exists():
-        content = blob_client.download_blob().readall()
-        return date.fromisoformat(json.loads(content)["end_date"])
+    if os.path.exists(metadata_file_path):
+        with open(metadata_file_path) as f:
+            return date.fromisoformat(json.load(f)["end_date"])
     return None
 
 def write_last_end_date(value):
-    blob_client = container_client.get_blob_client(metadata_blob_path)
-    blob_client.upload_blob(json.dumps({"end_date": value.isoformat()}), overwrite=True)
+    os.makedirs(os.path.dirname(metadata_file_path), exist_ok=True)
+    with open(metadata_file_path, "w") as f:
+        json.dump({"end_date": value.isoformat()}, f)
 
 last_end_date = read_last_end_date()
 end_date_changed = (last_end_date is None) or (end_date != last_end_date)
@@ -208,12 +166,6 @@ print(f"end_date changed since last run: {end_date_changed}")
 
 # MAGIC %md
 # MAGIC ## Step 4 — Main ingestion loop
-# MAGIC
-# MAGIC For each week: query the total record count first (from `meta.results.total`),
-# MAGIC then page through with `skip` in steps of `page_limit` until either all records
-# MAGIC are pulled or we hit `max_skip_per_query`. If a week hits that ceiling, it's
-# MAGIC flagged in the summary so you know that week's data may be incomplete and could
-# MAGIC be re-pulled in daily chunks later.
 
 # COMMAND ----------
 
@@ -223,10 +175,6 @@ for i, (week_start, week_end) in enumerate(weekly_ranges):
     is_most_recent_week = (i == len(weekly_ranges) - 1)
     print(f"\nWeek {week_start} to {week_end}")
 
-    # The most recent chunk only gets a "free pass" past skip_existing when
-    # end_date has actually changed since the last run — otherwise it's skipped
-    # just like any other already-ingested week, avoiding wasted OpenFDA calls
-    # on repeat runs with the same config.
     force_refetch_this_week = is_most_recent_week and end_date_changed
 
     if skip_existing and not force_refetch_this_week and week_already_ingested(week_start):
@@ -238,7 +186,6 @@ for i, (week_start, week_end) in enumerate(weekly_ranges):
 
     search_query = f"receiptdate:[{week_start.strftime('%Y%m%d')}+TO+{week_end.strftime('%Y%m%d')}]"
 
-    # First request tells us the total record count for this week via meta.results.total
     first_page = fetch_page(search_query, skip=0, limit=page_limit)
     total_available = first_page.get("meta", {}).get("results", {}).get("total", 0)
     print(f"  Total records available: {total_available}")
@@ -250,19 +197,16 @@ for i, (week_start, week_end) in enumerate(weekly_ranges):
     hit_ceiling = total_available > max_skip_per_query
     if hit_ceiling:
         print(f"  WARNING: this week has more records than the {max_skip_per_query} pagination ceiling.")
-        print(f"  Only the first {max_skip_per_query} will be pulled. Consider daily chunks for this week later.")
 
     records_pulled = 0
     part_number = 0
-    skip = 0
 
-    # Upload the first page we already fetched above
     results = first_page.get("results", [])
     if results:
-        blob_path = upload_page(first_page, week_start, part_number)
+        file_path = upload_page(first_page, week_start, part_number)
         records_pulled += len(results)
         part_number += 1
-        print(f"    Wrote part {part_number}: {len(results)} records -> {blob_path}")
+        print(f"    Wrote part {part_number}: {len(results)} records -> {file_path}")
 
     skip = page_limit
     while skip < min(total_available, max_skip_per_query):
@@ -271,10 +215,10 @@ for i, (week_start, week_end) in enumerate(weekly_ranges):
         results = page.get("results", [])
         if not results:
             break
-        blob_path = upload_page(page, week_start, part_number)
+        file_path = upload_page(page, week_start, part_number)
         records_pulled += len(results)
         part_number += 1
-        print(f"    Wrote part {part_number}: {len(results)} records -> {blob_path}")
+        print(f"    Wrote part {part_number}: {len(results)} records -> {file_path}")
         skip += page_limit
 
     ingestion_log.append({
@@ -288,9 +232,6 @@ for i, (week_start, week_end) in enumerate(weekly_ranges):
 
 # MAGIC %md
 # MAGIC ## Step 5 — Summary
-# MAGIC
-# MAGIC Quick sanity check before moving to Silver — total records pulled, and a flag
-# MAGIC for any week that hit the pagination ceiling and may need a follow-up daily pull.
 
 # COMMAND ----------
 
@@ -302,26 +243,10 @@ total_pages = sum(w["pages"] for w in processed)
 weeks_at_ceiling = [w["week_start"] for w in processed if w["hit_ceiling"]]
 
 print("=== Ingestion summary ===")
-print(f"Weeks total: {len(ingestion_log)} | skipped (already existed): {len(skipped_weeks)} | newly processed: {len(processed)}")
+print(f"Weeks total: {len(ingestion_log)} | skipped: {len(skipped_weeks)} | newly processed: {len(processed)}")
 print(f"Total records written this run: {total_records}")
 print(f"Total JSON files written this run: {total_pages}")
 print(f"Weeks that hit the pagination ceiling: {weeks_at_ceiling if weeks_at_ceiling else 'none'}")
 
-# Only persist the new end_date after a successful run, so a failed/partial
-# run doesn't falsely mark this end_date as "already handled" for next time.
 write_last_end_date(end_date)
 print(f"\nSaved end_date={end_date} as this run's checkpoint for next time.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Recap & next steps
-# MAGIC
-# MAGIC Bronze now has a properly partitioned dataset at
-# MAGIC `bronze/adverse_events/YYYY/MM/events_{week}_part{n}.json` spanning your
-# MAGIC configured date range — ready for the Silver notebook's wildcard read path
-# MAGIC exactly as originally designed, no changes needed there.
-# MAGIC
-# MAGIC If any weeks hit the pagination ceiling, note them — a good future exercise is
-# MAGIC re-running just those weeks in daily chunks instead of weekly, to guarantee full
-# MAGIC coverage even on unusually high-volume weeks.
