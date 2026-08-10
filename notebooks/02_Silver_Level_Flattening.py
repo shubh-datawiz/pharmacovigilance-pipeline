@@ -81,7 +81,7 @@ def list_bronze_files(base_path):
                             files.append(f.path)
     return files
 
-bronze_base_path = f"abfss://{bronze_container}@{storage_account}.dfs.core.windows.net/adverse_events/"
+bronze_base_path = f"/Volumes/{catalog_name}/bronze/raw_adverse_events/adverse_events/"
 all_bronze_files = list_bronze_files(bronze_base_path)
 
 already_loaded_files = set(
