@@ -55,5 +55,5 @@ targets:
   dev:
     mode: development
     workspace:
-      host: https://adb-7405610832791002.2.azuredatabricks.net   # <-- replace with your real workspace URL
+      host: https://dbc-5d348f46-d37c.cloud.databricks.com
     default: true
