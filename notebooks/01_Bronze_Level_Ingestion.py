@@ -18,7 +18,7 @@ from datetime import date, timedelta
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 0 — Config
+# MAGIC ## Step 0 — Configuration
 
 # COMMAND ----------
 
@@ -158,8 +158,8 @@ def write_last_end_date(value):
 last_end_date = read_last_end_date()
 end_date_changed = (last_end_date is None) or (end_date != last_end_date)
 
-print(f"Last run's end_date: {last_end_date}")
-print(f"This run's end_date: {end_date}")
+print(f"Last run's end_date: {last_end_date}") 
+print(f"This run's end_date: {end_date}") 
 print(f"end_date changed since last run: {end_date_changed}")
 
 # COMMAND ----------
