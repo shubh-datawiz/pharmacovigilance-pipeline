@@ -32,19 +32,9 @@
 from pyspark.sql import functions as F
 
 # --- Storage account / container config ---
-storage_account = "pharmacovigilance01"
-secret_scope = "pharmacovigilance"
-secret_key_name = "adls_pharmacovigilance01_key"
+catalog_name = "pharmacovigilance_ws"
 
-bronze_container = "bronze"
-silver_container = "silver"
-
-# abfss:// is the ADLS Gen2 driver — required since your storage account is Gen2, not plain Blob
-bronze_path = f"abfss://{bronze_container}@{storage_account}.dfs.core.windows.net/adverse_events/*/*/*.json"
-silver_events_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/events"
-silver_event_drug_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/event_drug"
-silver_event_reaction_path = f"abfss://{silver_container}@{storage_account}.dfs.core.windows.net/event_reaction"
-
+bronze_path = f"/Volumes/{catalog_name}/bronze/raw_adverse_events/adverse_events/*/*/*.json"
 
 
 print("Bronze read path:", bronze_path)
@@ -357,9 +347,9 @@ df_silver_events.printSchema()
     .format("delta")
     .mode("append")
     .partitionBy("event_year", "event_month")
-    .save(silver_events_path)
+    .saveAsTable("silver.events")
 )
-print("silver_events written to:", silver_events_path)
+print("silver_events written to: silver.events")
 
 # COMMAND ----------
 
@@ -369,9 +359,9 @@ print("silver_events written to:", silver_events_path)
     .write
     .format("delta")
     .mode("append")
-    .save(silver_event_drug_path)
+    .saveAsTable("silver.event_drug")
 )
-print("silver_event_drug written to:", silver_event_drug_path)
+print("silver_event_drug written to: silver.event_drug")
 
 # COMMAND ----------
 
@@ -381,9 +371,9 @@ print("silver_event_drug written to:", silver_event_drug_path)
     .write
     .format("delta")
     .mode("append")
-    .save(silver_event_reaction_path)
+    .saveAsTable("silver.event_reaction")
 )
-print("silver_event_reaction written to:", silver_event_reaction_path)
+print("silver_event_reaction written to: silver.event_reaction")
 
 # COMMAND ----------
 
@@ -413,30 +403,32 @@ print(f"Logged {len(new_bronze_files)} files as processed in silver.load_log")
 # MAGIC Registering the Delta paths as named tables lets you query them with plain SQL
 # MAGIC (`SELECT * FROM silver.events`) instead of always referencing the ADLS path —
 # MAGIC handy for ad-hoc checks and for Power BI's Databricks connector later.
+# MAGIC Note that the `saveAsTable()` calls above already did this for you, so this step is
+# MAGIC only needed if you want to explicitly control the table names or locations.
 
 # COMMAND ----------
 
-spark.sql("CREATE DATABASE IF NOT EXISTS silver")
+# spark.sql("CREATE DATABASE IF NOT EXISTS silver")
 
-spark.sql(f"""
-    CREATE TABLE IF NOT EXISTS silver.events
-    USING DELTA
-    LOCATION '{silver_events_path}'
-""")
+# spark.sql(f"""
+#     CREATE TABLE IF NOT EXISTS silver.events
+#     USING DELTA
+#     LOCATION '{silver_events_path}'
+# """)
 
-spark.sql(f"""
-    CREATE TABLE IF NOT EXISTS silver.event_drug
-    USING DELTA
-    LOCATION '{silver_event_drug_path}'
-""")
+# spark.sql(f"""
+#     CREATE TABLE IF NOT EXISTS silver.event_drug
+#     USING DELTA
+#     LOCATION '{silver_event_drug_path}'
+# """)
 
-spark.sql(f"""
-    CREATE TABLE IF NOT EXISTS silver.event_reaction
-    USING DELTA
-    LOCATION '{silver_event_reaction_path}'
-""")
+# spark.sql(f"""
+#     CREATE TABLE IF NOT EXISTS silver.event_reaction
+#     USING DELTA
+#     LOCATION '{silver_event_reaction_path}'
+# """)
 
-print("Silver tables registered in metastore: silver.events, silver.event_drug, silver.event_reaction")
+# print("Silver tables registered in metastore: silver.events, silver.event_drug, silver.event_reaction")
 
 # COMMAND ----------
 
