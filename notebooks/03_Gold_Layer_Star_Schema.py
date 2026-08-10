@@ -22,6 +22,9 @@
 # MAGIC Gold tables here are newly created output, not raw files landing from outside —
 # MAGIC so we let Unity Catalog manage their storage automatically (managed tables),
 # MAGIC avoiding the need to set up a third External Location.
+# MAGIC **Note on surrogate keys:** All dimensions and the fact table use surrogate
+# MAGIC keys (integers) rather than the raw text values from the API. This is standard star schema design, and avoids repeating long text values in the fact table and bridge tables. 
+# MAGIC The surrogate keys are generated using `row_number()` over a stable ordering of the distinct values, so re-running this notebook will assign the same keys to the same values as long as the underlying distinct set doesn't change.
 
 # COMMAND ----------
 
